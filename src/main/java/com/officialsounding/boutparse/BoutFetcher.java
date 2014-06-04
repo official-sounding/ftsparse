@@ -6,6 +6,7 @@ import com.google.code.geocoder.Geocoder;
 import com.google.code.geocoder.GeocoderRequestBuilder;
 import com.google.code.geocoder.model.*;
 import com.google.gson.Gson;
+import com.google.gson.reflect.TypeToken;
 import com.officialsounding.boutparse.model.Bout;
 import com.officialsounding.boutparse.model.Team;
 import org.jsoup.Jsoup;
@@ -15,7 +16,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.*;
+import java.sql.*;
+import java.sql.Date;
 import java.time.LocalDate;
+import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.regex.Pattern;
@@ -28,7 +32,7 @@ public class BoutFetcher {
     private static final Logger log = LoggerFactory.getLogger(BoutFetcher.class);
     private final Geocoder geocoder = new Geocoder();
 
-    public static void main(String[] args) throws IOException {
+    public static void main(String[] args) throws Exception{
 
         Set<Integer> teamIds = new HashSet<>();
         Set<Integer> tournamentIds = new HashSet<>();
@@ -37,13 +41,17 @@ public class BoutFetcher {
         Gson g = new Gson();
 
         List<Bout> bouts;
+        List<Team> teams;
 
 
-        File boutout = new File("C:/utils/bouts.json");
+
+        File boutout = new File("bouts.json");
+        File teamout = new File("teams.json");
+
         if(boutout.exists()) {
             log.info("bout file exists, reading in");
             try(InputStreamReader br = new InputStreamReader(new FileInputStream(boutout))) {
-                bouts = g.fromJson(br,List.class);
+                bouts = g.fromJson(br,new TypeToken<ArrayList<Bout>>() {}.getType());
             }
         } else {
             if(!boutout.createNewFile()) {
@@ -69,18 +77,72 @@ public class BoutFetcher {
 
         log.info("found {} unique team ids and {} unique tournament ids",teamIds.size(),tournamentIds.size());
 
-        List<Team> teams = bf.getTeamsByIDs(teamIds);
 
-        File teamout = new File("C:/utils/teams.json");
-        teamout.createNewFile();
-        try(OutputStreamWriter to = new OutputStreamWriter(new FileOutputStream(teamout))){
-            String teamJson = g.toJson(teams);
-            to.append(teamJson);
-            to.flush();
+        if(teamout.exists()) {
+            log.info("team file exists, reading in");
+            try(InputStreamReader tr = new InputStreamReader(new FileInputStream(teamout))) {
+                teams = g.fromJson(tr,new TypeToken<ArrayList<Team>>() {}.getType());
+            }
+        } else {
+            log.info("generating team file from web");
+            teamout.createNewFile();
+
+            teams = bf.getTeamsByIDs(teamIds);
+            try (OutputStreamWriter to = new OutputStreamWriter(new FileOutputStream(teamout))) {
+                String teamJson = g.toJson(teams);
+                to.append(teamJson);
+                to.flush();
+            }
         }
+
+
+        log.info("persisting bouts and teams to database");
+
+        bf.perist(bouts, teams, args[0]);
     }
 
+    private void perist(List<Bout> bouts, List<Team> teams, String password) throws SQLException{
 
+        String url = "jdbc:postgresql://localhost/boutfinder";
+        Properties props = new Properties();
+        props.setProperty("user","postgres");
+        props.setProperty("password",password);
+        Connection conn = DriverManager.getConnection(url, props);
+
+        String insertBout = "INSERT INTO bout (home_team_id, away_team_id, date, sanctioned_by) values (?,?,?,?)";
+        String insertTeam = "INSERT INTO team (id, name, location_text, lat, lng, url) values (?,?,?,?,?,?)";
+
+
+        for(Team team: teams) {
+            try(PreparedStatement ps = conn.prepareStatement(insertTeam)) {
+                ps.setInt(1,team.getId());
+                ps.setString(2,team.getName());
+                ps.setString(3,team.getLocationName());
+                if(team.getLocationCoords() != null) {
+                    ps.setDouble(4, team.getLocationCoords().getLat());
+                    ps.setDouble(5, team.getLocationCoords().getLon());
+                } else {
+                    ps.setDouble(4,0);
+                    ps.setDouble(5,0);
+                }
+
+                ps.setString(6,team.getWebsite());
+
+                ps.execute();
+            }
+        }
+
+        for(Bout bout: bouts) {
+            try(PreparedStatement ps = conn.prepareStatement(insertBout)) {
+                ps.setInt(1,bout.getHomeID());
+                ps.setInt(2,bout.getAwayID());
+                ps.setDate(3,new Date(Date.from(bout.getDate().atStartOfDay().toInstant(ZoneOffset.UTC)).getTime()));
+                ps.setString(4,bout.getSanctionedBy());
+
+                ps.execute();
+            }
+        }
+    }
 
 
     public List<Bout> getBoutList() throws IOException {
@@ -101,6 +163,7 @@ public class BoutFetcher {
             }
 
             log.debug("retrieved page {}",page);
+
 
             for(Element row: doc.select("table.views-table tr.upcoming")) {
                 Bout b = new Bout();
